@@ -1,43 +1,52 @@
 import streamlit as st
 import pandas as pd
 import yfinance as yf
+import requests
+import time
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import time
 
-# --- SAYFA YAPILANDIRMASI ---
-st.set_page_config(page_title="Oto-Tarayıcı & Grafik İstasyonu", layout="wide")
+# =============================================================================
+# 1. KONFİGÜRASYONLAR
+# =============================================================================
+st.set_page_config(page_title="Tam Otonom Algoritmik Tarayıcı", layout="wide")
 
-# --- STRATEJİ PARAMETRELERİ ---
+MARKET_CONFIGS = {
+    "Türkiye (BİST)": {"tv_market": "turkey", "yf_suffix": ".IS", "tv_prefix": "BIST:"},
+    "Amerika (ABD)": {"tv_market": "america", "yf_suffix": "", "tv_prefix": "NASDAQ:"} # NASDAQ/NYSE ortak arama için prefix
+}
+
 EMA_FAST = 12
 EMA_SLOW = 26
 RSI_LEN = 14
 ATR_LEN = 14
 
-# --- OTOMATİK HİSSE HAVUZLARI ---
-@st.cache_data(ttl=86400)
-def get_us_tickers():
-    """S&P 500 şirketlerini otomatik çeker."""
+# =============================================================================
+# 2. VERİ ÇEKME MOTORU (TRADINGVIEW API)
+# =============================================================================
+def get_all_market_symbols(mkt_config, limit=600):
+    """TradingView tarayıcısından piyasa değerine göre en büyük hisseleri çeker."""
+    url = f"https://scanner.tradingview.com/{mkt_config['tv_market']}/scan"
+    payload = {
+        "filter": [{"left": "type", "operation": "in_range", "right": ["stock"]}],
+        "options": {"lang": "en"}, 
+        "markets": [mkt_config['tv_market']],
+        "symbols": {"query": {"types": []}, "tickers": []},
+        "columns": ["name", "market_cap_basic"],
+        "sort": {"sortBy": "market_cap_basic", "sortOrder": "desc"}, 
+        "range": [0, limit] # Hız ve stabilite için ilk 600 hisse
+    }
     try:
-        table = pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')
-        return [t.replace('.', '-') for t in table[0]['Symbol'].tolist()]
-    except:
-        return ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN"] # Yedek
+        resp = requests.post(url, json=payload, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        if resp.status_code == 200: 
+            return [item["d"][0] for item in resp.json().get("data", [])]
+    except Exception as e:
+        st.error(f"TradingView API Hatası: {e}")
+    return []
 
-@st.cache_data(ttl=86400)
-def get_bist_tickers():
-    """BİST Tüm hisselerinin özet listesini getirir. 
-    (Tamamını çekmek yfinance'i kilitlediği için en hacimli ~150 hisse otomatik tanımlanmıştır)"""
-    return [
-        "THYAO", "ASELS", "TUPRS", "KCHOL", "AKBNK", "ISCTR", "BIMAS", "EREGL", "SAHOL", "SISE", 
-        "YKBNK", "GARAN", "ENKAI", "PETKM", "HEKTS", "KRDMD", "SASA", "FROTO", "TOASO", "PGSUS",
-        "DOAS", "MGROS", "ARCLK", "TCELL", "TTKOM", "EKGYO", "KOZAL", "KOZAA", "IPEKE", "ODAS",
-        "ASTOR", "ALFAS", "SMRTG", "GESAN", "EUPWR", "CWENE", "AKSA", "VESBE", "VESTL", "AYDEM",
-        "GWIND", "ENJSA", "CANTE", "QUAGR", "KCAER", "BRSAN", "MIATK", "KONTR", "YEOTK", "KMPUR"
-        # Not: Gerçek bir BİST Tüm csv'niz varsa burada pd.read_csv ile okutabilirsiniz.
-    ]
-
-# --- TEKNİK HESAPLAMALAR ---
+# =============================================================================
+# 3. KANTİTATİF ANALİZ VE RİSK YÖNETİMİ
+# =============================================================================
 def calculate_indicators(df):
     df['ema_fast'] = df['Close'].ewm(span=EMA_FAST, adjust=False).mean()
     df['ema_slow'] = df['Close'].ewm(span=EMA_SLOW, adjust=False).mean()
@@ -61,66 +70,77 @@ def rule_based_validation(action, rsi):
     if action == "SAT" and rsi < 45: return True, "Trend Onayı"
     return False, "Momentum Yetersiz"
 
-# --- GRAFİK ÇİZİM MOTURU (PLOTLY) ---
+# =============================================================================
+# 4. GÖRSELLEŞTİRME (PLOTLY)
+# =============================================================================
 def plot_setup(df, ticker, action):
-    """Candlestick, EMA ve RSI göstergelerini profesyonelce çizer."""
-    # Son 100 mumu alarak grafiği okunaklı tutalım
-    df_plot = df.tail(100)
+    df_plot = df.tail(100) # Son 100 işlem gününü göster
     
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
-                        vertical_spacing=0.03, subplot_titles=(f"{ticker} Fiyat & EMA", "RSI (14)"),
+                        vertical_spacing=0.03, subplot_titles=(f"{ticker} Fiyat & EMA Sinyali", "Momentum (RSI 14)"),
                         row_width=[0.3, 0.7])
 
-    # 1. Mum Grafiği
+    # Fiyat Mumları
     fig.add_trace(go.Candlestick(x=df_plot.index, open=df_plot['Open'], high=df_plot['High'],
                                  low=df_plot['Low'], close=df_plot['Close'], name="Fiyat"), row=1, col=1)
     
-    # EMA'lar
-    fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot['ema_fast'], line=dict(color='blue', width=1.5), name=f"EMA {EMA_FAST}"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot['ema_slow'], line=dict(color='orange', width=1.5), name=f"EMA {EMA_SLOW}"), row=1, col=1)
+    # Hareketli Ortalamalar
+    fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot['ema_fast'], line=dict(color='#3b82f6', width=1.5), name=f"EMA {EMA_FAST}"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot['ema_slow'], line=dict(color='#f59e0b', width=1.5), name=f"EMA {EMA_SLOW}"), row=1, col=1)
     
-    # 2. RSI Grafiği
-    fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot['rsi'], line=dict(color='purple', width=2), name="RSI"), row=2, col=1)
-    
-    # RSI Referans Çizgileri
-    fig.add_hline(y=70, line_dash="dot", line_color="red", row=2, col=1)
-    fig.add_hline(y=30, line_dash="dot", line_color="green", row=2, col=1)
+    # RSI Grafiği
+    fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot['rsi'], line=dict(color='#8b5cf6', width=2), name="RSI"), row=2, col=1)
+    fig.add_hline(y=70, line_dash="dot", line_color="#ef4444", row=2, col=1)
+    fig.add_hline(y=30, line_dash="dot", line_color="#10b981", row=2, col=1)
     fig.add_hline(y=50, line_dash="dash", line_color="gray", row=2, col=1)
 
-    # Sinyal İşaretçisi (Son mumun üzerine/altına ok koy)
-    signal_price = df_plot['Close'].iloc[-1]
+    # Sinyal Noktası
     signal_date = df_plot.index[-1]
-    
     if action == "AL":
-        fig.add_annotation(x=signal_date, y=df_plot['Low'].iloc[-1] * 0.98, text="🟢 AL ONAYI", showarrow=True, arrowhead=1, arrowcolor="green", row=1, col=1)
+        fig.add_annotation(x=signal_date, y=df_plot['Low'].iloc[-1] * 0.98, text="🟢 AL GİRİŞİ", showarrow=True, arrowhead=1, arrowcolor="#10b981", row=1, col=1)
     else:
-        fig.add_annotation(x=signal_date, y=df_plot['High'].iloc[-1] * 1.02, text="🔴 SAT ONAYI", showarrow=True, arrowhead=1, arrowcolor="red", row=1, col=1)
+        fig.add_annotation(x=signal_date, y=df_plot['High'].iloc[-1] * 1.02, text="🔴 SAT GİRİŞİ", showarrow=True, arrowhead=1, arrowcolor="#ef4444", row=1, col=1)
 
     fig.update_layout(xaxis_rangeslider_visible=False, template="plotly_dark", height=600, margin=dict(l=20, r=20, t=40, b=20))
     return fig
 
-# --- TOPLU ANALİZ ---
-def analyze_auto_batch(market_type):
+# =============================================================================
+# 5. OTONOM TARAMA MANTILIĞI
+# =============================================================================
+def analyze_auto_batch(mkt_key):
     valid_setups = []
+    mkt_config = MARKET_CONFIGS[mkt_key]
     
-    if market_type == "Türkiye (BİST)":
-        tickers = get_bist_tickers()
-        formatted_tickers = [f"{t}.IS" for t in tickers]
-    else:
-        tickers = get_us_tickers()
-        formatted_tickers = tickers
+    st.info("Adım 1: TradingView'dan hisse havuzu çekiliyor...")
+    tv_symbols = get_all_market_symbols(mkt_config, limit=600)
+    
+    if not tv_symbols:
+        return []
         
-    st.info(f"Sistem arka planda {len(formatted_tickers)} adet hisseyi otomatik analiz ediyor. Lütfen bekleyin...")
+    # Yahoo Finance formatına çevir (Noktaları tire yap, uzantıyı ekle)
+    yf_tickers = []
+    for s in tv_symbols:
+        clean_s = s.replace('.', '-')
+        yf_tickers.append(f"{clean_s}{mkt_config['yf_suffix']}")
+        
+    st.info(f"Adım 2: {len(yf_tickers)} hissenin 6 aylık verisi tek seferde indiriliyor (Toplu İşlem)...")
     
-    # Veriyi Batch olarak çek
-    data = yf.download(" ".join(formatted_tickers), period="6mo", interval="1d", group_by='ticker', progress=False)
+    # Çoklu indirme
+    data = yf.download(" ".join(yf_tickers), period="6mo", interval="1d", group_by='ticker', progress=False)
     
     progress_bar = st.progress(0)
+    status_text = st.empty()
     
-    for i, ticker in enumerate(formatted_tickers):
+    total_symbols = len(yf_tickers)
+    
+    for i, ticker in enumerate(yf_tickers):
+        status_text.text(f"Algoritma Çalışıyor: {ticker} ({i+1}/{total_symbols})")
         try:
-            df = data[ticker].dropna() if len(formatted_tickers) > 1 else data.dropna()
-            if len(df) < 50: continue
+            # Çoklu indirme yapısına göre dataframe'i seç
+            df = data[ticker].dropna() if total_symbols > 1 else data.dropna()
+            
+            if len(df) < 50: 
+                continue
                 
             df = calculate_indicators(df.copy())
             current, previous = df.iloc[-1], df.iloc[-2]
@@ -139,8 +159,10 @@ def analyze_auto_batch(market_type):
                     tp1 = price + (atr * 1.5) if action == "AL" else price - (atr * 1.5)
                     tp2 = price + (atr * 3.0) if action == "AL" else price - (atr * 3.0)
                     
+                    display_symbol = ticker.replace(mkt_config['yf_suffix'], '')
+                    
                     valid_setups.append({
-                        "Sembol": ticker.replace('.IS', ''),
+                        "Sembol": display_symbol,
                         "Sinyal": action,
                         "Fiyat": round(price, 2),
                         "RSI": round(rsi, 2),
@@ -148,49 +170,58 @@ def analyze_auto_batch(market_type):
                         "SL": round(sl, 2),
                         "TP1": round(tp1, 2),
                         "TP2": round(tp2, 2),
-                        "Dataframe": df # Grafiği çizmek için df'i kaydediyoruz
+                        "Dataframe": df,
+                        "TV_Link": f"https://www.tradingview.com/chart/?symbol={mkt_config['tv_prefix']}{display_symbol}"
                     })
         except:
             pass
-        progress_bar.progress((i + 1) / len(formatted_tickers))
+        progress_bar.progress((i + 1) / total_symbols)
         
+    status_text.empty()
+    progress_bar.empty()
     return valid_setups
 
-# --- ARAYÜZ ---
-st.title("🤖 Tam Otomatik Algoritmik Tarayıcı & Grafik İstasyonu")
-st.markdown("Hisse girmeye gerek kalmadan tüm piyasayı tarar, geçerli formasyonları bulur ve grafiklerini otomatik çizer.")
+# =============================================================================
+# 6. KULLANICI ARAYÜZÜ (UI)
+# =============================================================================
+st.title("🌐 Otonom Piyasa Tarayıcı & Analiz İstasyonu")
+st.markdown("TradingView altyapısını kullanarak tüm piyasayı anlık çeker, EMA 12/26 & RSI koşullarını hesaplar ve interaktif grafikle sunar.")
 st.markdown("---")
 
-market_selection = st.radio("Taranacak Piyasayı Seçin (Otomatik Havuz):", ["Türkiye (BİST)", "ABD Borsaları (S&P 500)"], horizontal=True)
+col_mkt, col_btn = st.columns([2, 1])
+with col_mkt:
+    selected_market = st.radio("Taranacak Piyasayı Seçin:", list(MARKET_CONFIGS.keys()), horizontal=True)
+with col_btn:
+    st.write("##")
+    start_scan = st.button("🚀 OTONOM TARAMAYI BAŞLAT", type="primary", use_container_width=True)
 
-if st.button("🚀 Piyasayı Otomatik Tara ve Grafikleri Hazırla", type="primary", use_container_width=True):
+if start_scan:
     start_time = time.time()
-    results = analyze_auto_batch(market_selection)
+    results = analyze_auto_batch(selected_market)
     
     if not results:
-        st.warning("Bu piyasada şu an geçerli (Onaylı) bir EMA + RSI formasyonu bulunamadı.")
+        st.warning("Piyasada şu an EMA kesişimi ve RSI onayı alan bir hisse bulunamadı.")
     else:
-        st.success(f"Tarama {round(time.time() - start_time, 1)} saniyede bitti. **{len(results)}** geçerli fırsat bulundu.")
+        st.success(f"Tarama {round(time.time() - start_time, 1)} saniyede tamamlandı! **{len(results)}** adet işlem fırsatı bulundu.")
         
         for setup in results:
             st.markdown("---")
-            col1, col2 = st.columns([1, 3])
+            col_info, col_chart = st.columns([1, 2])
             
-            with col1:
+            with col_info:
                 color = "🟢" if setup['Sinyal'] == "AL" else "🔴"
                 st.subheader(f"{color} {setup['Sembol']}")
-                st.metric("Sinyal Yönü", setup['Sinyal'])
+                st.metric("İşlem Yönü", setup['Sinyal'])
                 st.metric("Giriş Fiyatı", setup['Fiyat'])
                 st.metric("RSI Değeri", setup['RSI'], delta=setup['Nedeni'], delta_color="normal" if setup['Sinyal'] == "AL" else "inverse")
                 
-                st.markdown("**Risk Yönetimi:**")
-                st.code(f"SL : {setup['SL']}\nTP1: {setup['TP1']}\nTP2: {setup['TP2']}")
+                st.markdown("**Dinamik ATR Risk Yönetimi:**")
+                st.code(f"Stop Loss (SL) : {setup['SL']}\nKar Al 1 (TP1)  : {setup['TP1']}\nKar Al 2 (TP2)  : {setup['TP2']}")
                 
-                # TradingView Butonu Dinamik URL'si
-                tv_symbol = f"BIST:{setup['Sembol']}" if market_selection == "Türkiye (BİST)" else f"NASDAQ:{setup['Sembol']}"
-                st.link_button("📈 TradingView'da İncele", f"https://www.tradingview.com/chart/?symbol={tv_symbol}", use_container_width=True)
+                # TradingView Dinamik Link Butonu
+                st.link_button("📈 TradingView'da İncele", setup['TV_Link'], use_container_width=True)
 
-            with col2:
-                # Arka planda kaydettiğimiz DataFrame ile anında grafik çiziyoruz
+            with col_chart:
+                # Plotly interaktif grafik render
                 fig = plot_setup(setup['Dataframe'], setup['Sembol'], setup['Sinyal'])
                 st.plotly_chart(fig, use_container_width=True)
